@@ -89,12 +89,15 @@ import qualified Data.Text.Encoding                   as TE
 import qualified Network.HPACK                        as HTTP2
 import qualified Network.HTTP2                        as HTTP2
 
+import qualified Control.Concurrent.RLock             as RL
+
 -- | A session that manages connections to Apple's push notification service
 data ApnSession = ApnSession
     { apnSessionPool              :: !(IORef [ApnConnection])
     , apnSessionConnectionInfo    :: !ApnConnectionInfo
     , apnSessionConnectionManager :: !ThreadId
-    , apnSessionOpen              :: !(IORef Bool)}
+    , apnSessionOpen              :: !(IORef Bool)
+    , apnSessionLock              :: RL.RLock }
 
 -- | Information about an APN connection
 data ApnConnectionInfo = ApnConnectionInfo
@@ -391,10 +394,14 @@ newSession certKey certPath caPath dev maxparallel topic = do
     connections <- newIORef []
     connectionManager <- forkIO $ manage 600 connections
     isOpen <- newIORef True
-    let session = ApnSession connections connInfo connectionManager isOpen
+    lock <- RL.new
+    let session = ApnSession connections connInfo connectionManager isOpen lock
     addFinalizer session $
         closeSession session
     return session
+
+withSession :: ApnSession -> IO a -> IO a
+withSession s = RL.with (apnSessionLock s)
 
 -- | Manually close a session. The session must not be used anymore
 -- after it has been closed. Calling this function will close
@@ -403,7 +410,7 @@ newSession certKey certPath caPath dev maxparallel topic = do
 -- automatically when they are garbage collected, so it is not necessary
 -- to call this function.
 closeSession :: ApnSession -> IO ()
-closeSession s = do
+closeSession s = withSession s $ do
     isOpen <- atomicModifyIORef' (apnSessionOpen s) (False,)
     unless isOpen $ error "Session is already closed"
     killThread (apnSessionConnectionManager s)
@@ -417,7 +424,7 @@ isOpen :: ApnSession -> IO Bool
 isOpen = readIORef . apnSessionOpen
 
 withConnection :: ApnSession -> (ApnConnection -> IO a) -> IO a
-withConnection s action = do
+withConnection s action = withSession s $ do
     ensureOpen s
     let pool = apnSessionPool s
     connections <- readIORef pool
