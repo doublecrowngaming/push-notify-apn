@@ -89,12 +89,15 @@ import qualified Data.Text.Encoding                   as TE
 import qualified Network.HPACK                        as HTTP2
 import qualified Network.HTTP2                        as HTTP2
 
+import qualified Control.Concurrent.RLock             as RL
+
 -- | A session that manages connections to Apple's push notification service
 data ApnSession = ApnSession
     { apnSessionPool              :: !(IORef [ApnConnection])
     , apnSessionConnectionInfo    :: !ApnConnectionInfo
     , apnSessionConnectionManager :: !ThreadId
-    , apnSessionOpen              :: !(IORef Bool)}
+    , apnSessionOpen              :: !(IORef Bool)
+    , apnSessionLock              :: RL.RLock }
 
 -- | Information about an APN connection
 data ApnConnectionInfo = ApnConnectionInfo
@@ -391,10 +394,17 @@ newSession certKey certPath caPath dev maxparallel topic = do
     connections <- newIORef []
     connectionManager <- forkIO $ manage 600 connections
     isOpen <- newIORef True
-    let session = ApnSession connections connInfo connectionManager isOpen
+    lock <- RL.new
+    let session = ApnSession connections connInfo connectionManager isOpen lock
     addFinalizer session $
         closeSession session
     return session
+
+withSessionLock :: ApnSession -> IO a -> IO a
+withSessionLock ApnSession{..} = RL.with apnSessionLock
+
+withoutSessionLock :: ApnSession -> IO a -> IO a
+withoutSessionLock ApnSession{..} = bracket_ (RL.release apnSessionLock) (RL.acquire apnSessionLock)
 
 -- | Manually close a session. The session must not be used anymore
 -- after it has been closed. Calling this function will close
@@ -403,7 +413,7 @@ newSession certKey certPath caPath dev maxparallel topic = do
 -- automatically when they are garbage collected, so it is not necessary
 -- to call this function.
 closeSession :: ApnSession -> IO ()
-closeSession s = do
+closeSession s = withSessionLock s $ do
     isOpen <- atomicModifyIORef' (apnSessionOpen s) (False,)
     unless isOpen $ error "Session is already closed"
     killThread (apnSessionConnectionManager s)
@@ -417,7 +427,7 @@ isOpen :: ApnSession -> IO Bool
 isOpen = readIORef . apnSessionOpen
 
 withConnection :: ApnSession -> (ApnConnection -> IO a) -> IO a
-withConnection s action = do
+withConnection s action = withSessionLock s $ do
     ensureOpen s
     let pool = apnSessionPool s
     connections <- readIORef pool
@@ -425,7 +435,7 @@ withConnection s action = do
     if len == 0
     then do
         conn <- newConnection s
-        res <- action conn
+        res <- withoutSessionLock s $ action conn
         atomicModifyIORef' pool (\a -> (conn:a, ()))
         return res
     else do
@@ -437,7 +447,7 @@ withConnection s action = do
         isOpen <- readIORef (apnConnectionOpen conn)
         if isOpen
         then do
-            res <- action conn1
+            res <- withoutSessionLock s $ action conn1
             atomicModifyIORef' pool (\a -> (conn1:a, ()))
             return res
         else withConnection s action
